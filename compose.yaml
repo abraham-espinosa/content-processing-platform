@@ -1,0 +1,26 @@
+services:
+  api-1:
+    build:
+      context: ./app
+    image: content-processing-api:1.0
+    ports:
+      - "3001:3000"
+    environment:
+      APP_VERSION: "1.0"
+      INSTANCE_ID: "api-1"
+    networks:
+      - platform-network
+
+  api-2:
+    image: content-processing-api:1.0
+    ports:
+      - "3002:3000"
+    environment:
+      APP_VERSION: "1.0"
+      INSTANCE_ID: "api-2"
+    networks:
+      - platform-network
+
+networks:
+  platform-network:
+    driver: bridge
