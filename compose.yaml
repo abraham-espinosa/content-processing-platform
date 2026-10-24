@@ -39,6 +39,7 @@ services:
       retries: 5
     networks:
       - platform-network
+  
   minio:
     image: docker.io/pgsty/silo:RELEASE.2026-09-03T13-18-01Z
     command: server /data --console-address ":9001"
@@ -53,6 +54,26 @@ services:
       - minio-data:/data
     networks:
       - platform-network
+
+  rabbitmq:
+    image: rabbitmq:4.3.6-management-alpine
+    hostname: rabbitmq
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:?Set RABBITMQ_USER in .env}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:?Set RABBITMQ_PASSWORD in .env}
+    ports:
+      - "127.0.0.1:15672:15672"
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - platform-network
+
 networks:
   platform-network:
     driver: bridge
@@ -60,3 +81,4 @@ networks:
 volumes:
   postgres-data:
   minio-data:
+  rabbitmq-data:
