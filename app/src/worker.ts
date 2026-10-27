@@ -42,20 +42,43 @@ async function start() {
           message.content.toString()
         );
 
+        const workerId = process.env.HOSTNAME ?? "unknown-worker";
+
         const claim = await pool.query(
           `UPDATE jobs
-           SET status = 'processing',
-               attempts = attempts + 1
-           WHERE id = $1 AND status = 'pending'
-           RETURNING id`,
-          [jobId]
+          SET status = 'processing',
+              attempts = attempts + 1,
+              worker_id = $2,
+              lease_expires_at = NOW() + INTERVAL '30 seconds'
+          WHERE id = $1
+            AND (
+              status = 'pending'
+              OR (
+                status = 'processing'
+                AND lease_expires_at < NOW()
+              )
+            )
+          RETURNING id`,
+          [jobId, workerId]
         );
 
         if (claim.rowCount === 0) {
           const result = await pool.query(
-            "SELECT status FROM jobs WHERE id = $1",
-            [jobId]
+            `UPDATE jobs
+            SET status = 'completed',
+                processed_at = NOW(),
+                lease_expires_at = NULL
+            WHERE id = $1
+              AND worker_id = $2
+              AND status = 'processing'
+              AND lease_expires_at > NOW()
+            RETURNING id`,
+            [jobId, workerId]
           );
+
+          if (result.rowCount === 0) {
+            console.warn(`Lease expired or ownership changed: ${jobId}`);
+          }
 
           if (result.rows[0]?.status === "completed") {
             console.log(`Job ${jobId} already completed`);
