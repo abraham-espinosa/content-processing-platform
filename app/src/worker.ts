@@ -15,19 +15,19 @@ const sleep = (ms: number) =>
   new Promise((resolve) => setTimeout(resolve, ms));
 
 async function start() {
-  const connection = await amqp.connect(
-    process.env.RABBITMQ_URL!
-  );
+  const rabbitmqUrl = process.env.RABBITMQ_URL;
 
+  if (!rabbitmqUrl) {
+    throw new Error("RABBITMQ_URL is required");
+  }
+
+  const connection = await amqp.connect(rabbitmqUrl);
   const channel = await connection.createChannel();
 
-  await channel.assertQueue(QUEUE, {
-    durable: true,
-    arguments: {
-      "x-queue-type": "quorum",
-    },
-  });
+  // RabbitMQ topology is created by setup-rabbitmq.ts.
+  await channel.checkQueue(QUEUE);
 
+  // Process one unacknowledged message at a time.
   await channel.prefetch(1);
 
   console.log("Worker waiting for jobs...");
@@ -42,77 +42,97 @@ async function start() {
           message.content.toString()
         );
 
-        const workerId = process.env.HOSTNAME ?? "unknown-worker";
+        if (typeof jobId !== "string" || !jobId) {
+          throw new Error("Invalid message: jobId is required");
+        }
 
+        const workerId =
+          process.env.HOSTNAME ?? "unknown-worker";
+
+        // STEP 1: Atomically claim the job.
         const claim = await pool.query(
           `UPDATE jobs
-          SET status = 'processing',
-              attempts = attempts + 1,
-              worker_id = $2,
-              lease_expires_at = NOW() + INTERVAL '30 seconds'
-          WHERE id = $1
-            AND (
-              status = 'pending'
-              OR (
-                status = 'processing'
-                AND lease_expires_at < NOW()
-              )
-            )
-          RETURNING id`,
+           SET status = 'processing',
+               attempts = attempts + 1,
+               worker_id = $2,
+               lease_expires_at = NOW() + INTERVAL '30 seconds'
+           WHERE id = $1
+             AND (
+               status = 'pending'
+               OR (
+                 status = 'processing'
+                 AND lease_expires_at < NOW()
+               )
+             )
+           RETURNING id`,
           [jobId, workerId]
         );
 
+        // STEP 2: Handle jobs that cannot be claimed.
         if (claim.rowCount === 0) {
           const result = await pool.query(
-            `UPDATE jobs
-            SET status = 'completed',
-                processed_at = NOW(),
-                lease_expires_at = NULL
-            WHERE id = $1
-              AND worker_id = $2
-              AND status = 'processing'
-              AND lease_expires_at > NOW()
-            RETURNING id`,
-            [jobId, workerId]
+            `SELECT status FROM jobs WHERE id = $1`,
+            [jobId]
           );
 
-          if (result.rowCount === 0) {
-            console.warn(`Lease expired or ownership changed: ${jobId}`);
-          }
+          const status = result.rows[0]?.status;
 
-          if (result.rows[0]?.status === "completed") {
-            console.log(`Job ${jobId} already completed`);
+          // Duplicate delivery after successful processing.
+          if (status === "completed") {
+            console.log(
+              `Job ${jobId} already completed`
+            );
+
             channel.ack(message);
             return;
           }
 
-          // Keep unresolved jobs for manual investigation
-          // rather than silently acknowledging them.
-          console.error(`Job ${jobId} cannot be claimed`);
+          // For now, unresolved messages go to the DLQ.
+          console.warn(
+            `Job ${jobId} cannot be claimed. Status: ${
+              status ?? "not found"
+            }`
+          );
+
           channel.nack(message, false, false);
           return;
         }
 
+        // STEP 3: Process the job.
         console.log(`Processing job ${jobId}`);
 
         await sleep(2000);
 
-        await pool.query(
+        // STEP 4: Complete only if this worker still
+        // owns a valid lease.
+        const result = await pool.query(
           `UPDATE jobs
            SET status = 'completed',
-               processed_at = NOW()
-           WHERE id = $1`,
-          [jobId]
+               processed_at = NOW(),
+               lease_expires_at = NULL
+           WHERE id = $1
+             AND worker_id = $2
+             AND status = 'processing'
+             AND lease_expires_at > NOW()
+           RETURNING id`,
+          [jobId, workerId]
         );
+
+        if (result.rowCount === 0) {
+          throw new Error(
+            `Cannot complete job ${jobId}: lease expired or ownership changed`
+          );
+        }
 
         console.log(`Completed job ${jobId}`);
 
+        // STEP 5: Acknowledge only after database success.
         channel.ack(message);
       } catch (error) {
         console.error("Worker error:", error);
 
-        // Reject without requeue to avoid an infinite
-        // immediate retry loop.
+        // Reject without immediate requeue.
+        // RabbitMQ sends it to the configured DLQ.
         channel.nack(message, false, false);
       }
     },
@@ -121,6 +141,6 @@ async function start() {
 }
 
 start().catch((error) => {
-  console.error(error);
+  console.error("Worker startup failed:", error);
   process.exit(1);
 });
